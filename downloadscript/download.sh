@@ -20,7 +20,7 @@ RANGE=""
 REDOWNLOAD=0
 SPOTIFY=0
 
-# Existing exported variables take priority over .env.
+# Exported environment variables take priority over .env.
 SPOTIFY_CLIENT_ID="${SPOTIFY_CLIENT_ID:-}"
 SPOTIFY_CLIENT_SECRET="${SPOTIFY_CLIENT_SECRET:-}"
 
@@ -46,8 +46,8 @@ Options:
   --range START:          Download from START to the end
   --range :END            Download from the beginning through END
   --range START-          Download from START to the end
-  --redownload             Redownload even if previously completed
-  --spotify                Search Spotify after successful downloads
+  --redownload             Retry previously completed items
+  --spotify                Try Spotify API, then web-search fallback
   --help, -h               Show this help
 
 Examples:
@@ -56,18 +56,18 @@ Examples:
   ./download.sh --mp3 --spotify
   ./download.sh --audio --spotify --range 1:10
   ./download.sh --mp3 --spotify -o "$HOME/Music"
-  ./download.sh --mp4 -o .
   ./download.sh --redownload --range 1:5
 
 Input:
   urls.txt beside this script, one URL per line.
-  Blank lines and lines starting with # are ignored.
+  Blank lines and lines beginning with # are ignored.
 
 Spotify:
-  Reads SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET from exported
-  environment variables first, then from .env beside this script.
-  Prompts for missing credentials when running interactively.
-  .example.env is a template and is not loaded automatically.
+  Uses exported SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET first,
+  then reads missing values from .env beside this script.
+  If the Spotify API fails, including with HTTP 403, the script
+  searches the web for a Spotify track URL.
+  If no direct track URL is found, it saves a Spotify search URL.
 EOF
 }
 
@@ -161,11 +161,7 @@ detect_os
 echo "Operating system: $OS"
 echo "Mode:             $MODE"
 echo "Output directory: $DOWNLOAD_DIR"
-if (( SPOTIFY == 1 )); then
-    echo "Spotify lookup:   enabled"
-else
-    echo "Spotify lookup:   disabled"
-fi
+echo "Spotify lookup:   $([[ "$SPOTIFY" == 1 ]] && echo enabled || echo disabled)"
 
 # ============================================================
 # Installation helpers
@@ -267,7 +263,6 @@ install_ytdlp() {
     esac
 
     refresh_path
-
     command -v yt-dlp >/dev/null 2>&1 ||
         command -v yt-dlp.exe >/dev/null 2>&1
 }
@@ -402,10 +397,8 @@ FFMPEG_AVAILABLE=0
 
 if command -v ffmpeg >/dev/null 2>&1; then
     FFMPEG_AVAILABLE=1
-else
-    if ask_install "FFmpeg"; then
-        install_ffmpeg && FFMPEG_AVAILABLE=1
-    fi
+elif ask_install "FFmpeg"; then
+    install_ffmpeg && FFMPEG_AVAILABLE=1
 fi
 
 if [[ "$MODE" == "audio" || "$MODE" == "mp3" ]] &&
@@ -419,7 +412,7 @@ if (( FFMPEG_AVAILABLE == 0 )); then
 fi
 
 # ============================================================
-# Spotify credentials: exported environment first, then .env
+# Read .env credentials without overriding exported values
 # ============================================================
 
 load_spotify_env() {
@@ -430,11 +423,9 @@ load_spotify_env() {
     while IFS= read -r line || [[ -n "$line" ]]; do
         line="${line%$'\r'}"
 
-        # Ignore blank lines and comments.
         [[ "$line" =~ ^[[:space:]]*$ ]] && continue
         [[ "$line" =~ ^[[:space:]]*# ]] && continue
 
-        # Support KEY=value and export KEY=value.
         line="${line#export }"
 
         if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=(.*)$ ]]; then
@@ -444,7 +435,6 @@ load_spotify_env() {
             value="${value#"${value%%[![:space:]]*}"}"
             value="${value%"${value##*[![:space:]]}"}"
 
-            # Remove surrounding matching quotes.
             if [[ "$value" == \"*\" && "$value" == *\" ]]; then
                 value="${value:1:${#value}-2}"
             elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
@@ -453,14 +443,12 @@ load_spotify_env() {
 
             case "$key" in
                 SPOTIFY_CLIENT_ID)
-                    if [[ -z "$SPOTIFY_CLIENT_ID" ]]; then
+                    [[ -n "$SPOTIFY_CLIENT_ID" ]] ||
                         SPOTIFY_CLIENT_ID="$value"
-                    fi
                     ;;
                 SPOTIFY_CLIENT_SECRET)
-                    if [[ -z "$SPOTIFY_CLIENT_SECRET" ]]; then
+                    [[ -n "$SPOTIFY_CLIENT_SECRET" ]] ||
                         SPOTIFY_CLIENT_SECRET="$value"
-                    fi
                     ;;
             esac
         fi
@@ -478,18 +466,16 @@ if (( SPOTIFY == 1 )); then
         PYTHON="python3"
     elif command -v python >/dev/null 2>&1; then
         PYTHON="python"
-    else
-        if ask_install "Python 3"; then
-            install_python || {
-                echo "Error: Python could not be installed."
-                exit 1
-            }
+    elif ask_install "Python 3"; then
+        install_python || {
+            echo "Error: Python could not be installed."
+            exit 1
+        }
 
-            if command -v python3 >/dev/null 2>&1; then
-                PYTHON="python3"
-            elif command -v python >/dev/null 2>&1; then
-                PYTHON="python"
-            fi
+        if command -v python3 >/dev/null 2>&1; then
+            PYTHON="python3"
+        elif command -v python >/dev/null 2>&1; then
+            PYTHON="python"
         fi
     fi
 
@@ -498,10 +484,8 @@ if (( SPOTIFY == 1 )); then
         exit 1
     fi
 
-    # Only fill missing values from .env; exported values win.
     load_spotify_env
 
-    # Prompt for any credentials still missing.
     if [[ -z "$SPOTIFY_CLIENT_ID" || -z "$SPOTIFY_CLIENT_SECRET" ]]; then
         if [[ ! -t 0 ]]; then
             echo "Error: Spotify credentials are missing."
@@ -531,7 +515,7 @@ if (( SPOTIFY == 1 )); then
 fi
 
 # ============================================================
-# Validate input and prepare output directory
+# Validate URL list and prepare output
 # ============================================================
 
 if [[ ! -f "$URLS_FILE" ]]; then
@@ -546,10 +530,7 @@ mkdir -p "$DOWNLOAD_DIR" || {
 }
 
 DOWNLOAD_DIR="$(cd -- "$DOWNLOAD_DIR" && pwd)" || exit 1
-
-if (( SPOTIFY == 1 )); then
-    SPOTIFY_LINKS_FILE="$DOWNLOAD_DIR/spotify-links.tsv"
-fi
+SPOTIFY_LINKS_FILE="$DOWNLOAD_DIR/spotify-links.tsv"
 
 CLEAN_FILE="$(mktemp)" || exit 1
 SELECTED_FILE="$(mktemp)" || {
@@ -662,13 +643,96 @@ record_completed() {
 }
 
 # ============================================================
-# Spotify lookup helper
+# Spotify result writer
+#
+# TSV columns:
+# Source title, Source artist, Candidate title, Candidate artist,
+# Spotify URL, Lookup method
+#
+# Existing five-column TSV files are upgraded automatically.
 # ============================================================
 
-spotify_lookup() {
-    local url="$1"
+write_spotify_result() {
+    "$PYTHON" - "$SPOTIFY_LINKS_FILE" "$@" <<'PYTHON_WRITER'
+import csv
+import os
+import sys
+import tempfile
 
-    "$PYTHON" - "$YTDLP" "$url" "$SPOTIFY_LINKS_FILE" <<'PYTHON_SCRIPT'
+path, source_title, source_artist, candidate_title, candidate_artist, url, method = sys.argv[1:]
+
+header = [
+    "Source title",
+    "Source artist",
+    "Spotify candidate title",
+    "Spotify candidate artist",
+    "Spotify URL",
+    "Lookup method",
+]
+
+rows = []
+
+if os.path.exists(path) and os.path.getsize(path) > 0:
+    try:
+        with open(path, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f, delimiter="\t"))
+    except Exception:
+        rows = []
+
+    if rows:
+        old_header = rows[0]
+        if old_header != header:
+            upgraded = [header]
+            for row in rows[1:]:
+                row = row[:]
+                while len(row) < 6:
+                    row.append("")
+                if len(row) == 5:
+                    row.append("Previous result")
+                upgraded.append(row[:6])
+            rows = upgraded
+else:
+    rows = [header]
+
+rows.append([
+    source_title,
+    source_artist,
+    candidate_title,
+    candidate_artist,
+    url,
+    method,
+])
+
+directory = os.path.dirname(os.path.abspath(path))
+fd, temp_path = tempfile.mkstemp(prefix=".spotify-links-", dir=directory)
+
+try:
+    with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter="\t", lineterminator="\n")
+        writer.writerows(rows)
+    os.replace(temp_path, path)
+except Exception:
+    try:
+        os.unlink(temp_path)
+    except OSError:
+        pass
+    raise
+
+print("Saved Spotify result:", url)
+PYTHON_WRITER
+}
+
+# ============================================================
+# Spotify API lookup
+#
+# Exit 0 if the API returns a candidate and it is saved.
+# Exit non-zero on API/auth/search failure, triggering web fallback.
+# ============================================================
+
+spotify_api_lookup() {
+    local source_url="$1"
+
+    "$PYTHON" - "$YTDLP" "$source_url" "$SPOTIFY_LINKS_FILE" <<'PYTHON_API'
 import base64
 import csv
 import json
@@ -678,19 +742,16 @@ import sys
 import urllib.parse
 import urllib.request
 import urllib.error
+import tempfile
 
 ytdlp, source_url, output_file = sys.argv[1:4]
 client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
 client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "")
 
 def fail(message):
-    print("Spotify lookup warning:", message, file=sys.stderr)
+    print("Spotify API warning:", message, file=sys.stderr)
     sys.exit(1)
 
-if not client_id or not client_secret:
-    fail("Spotify credentials are missing.")
-
-# Read metadata without downloading the source a second time.
 try:
     result = subprocess.run(
         [ytdlp, "--dump-single-json", "--skip-download", source_url],
@@ -703,20 +764,22 @@ try:
 except Exception as exc:
     fail("Could not read source metadata: " + str(exc))
 
-title = (metadata.get("track") or metadata.get("title") or "").strip()
-artist = (
+source_title = (metadata.get("track") or metadata.get("title") or "").strip()
+source_artist = (
     metadata.get("artist")
     or metadata.get("creator")
     or metadata.get("uploader")
     or ""
 ).strip()
 
-if not title:
+if not source_title:
     fail("No title could be extracted from the source.")
 
-print("Spotify search:", title, "-", artist or "artist unknown")
+if not client_id or not client_secret:
+    fail("Spotify credentials are missing.")
 
-# Spotify Client Credentials flow.
+print("Spotify API search:", source_title, "-", source_artist or "artist unknown")
+
 token_data = urllib.parse.urlencode({
     "grant_type": "client_credentials",
 }).encode("utf-8")
@@ -739,9 +802,9 @@ try:
     with urllib.request.urlopen(token_request, timeout=30) as response:
         token = json.loads(response.read().decode("utf-8"))["access_token"]
 except Exception as exc:
-    fail("Spotify authentication failed; check credentials and API eligibility: " + str(exc))
+    fail("Spotify authentication failed: " + str(exc))
 
-query = f'track:{title} artist:{artist}' if artist else title
+query = f'track:{source_title} artist:{source_artist}' if source_artist else source_title
 params = urllib.parse.urlencode({
     "q": query,
     "type": "track",
@@ -758,18 +821,17 @@ try:
         search_data = json.loads(response.read().decode("utf-8"))
 except urllib.error.HTTPError as exc:
     detail = exc.read().decode("utf-8", errors="replace")
-    fail(f"Spotify search returned HTTP {exc.code}: {detail[:300]}")
+    fail(f"Spotify search returned HTTP {exc.code}: {detail[:400]}")
 except Exception as exc:
     fail("Spotify search failed: " + str(exc))
 
 tracks = search_data.get("tracks", {}).get("items", [])
 if not tracks:
-    fail("No matching Spotify track found.")
+    fail("Spotify API returned no track candidates.")
 
-# First result is a candidate, not a guaranteed exact recording.
 match = tracks[0]
-matched_title = match.get("name", "")
-matched_artists = ", ".join(
+candidate_title = match.get("name", "")
+candidate_artist = ", ".join(
     a.get("name", "") for a in match.get("artists", [])
 )
 spotify_url = match.get("external_urls", {}).get("spotify", "")
@@ -778,35 +840,374 @@ if not spotify_url and match.get("id"):
     spotify_url = "https://open.spotify.com/track/" + match["id"]
 
 if not spotify_url:
-    fail("The top result did not include a shareable Spotify URL.")
+    fail("The API result did not include a Spotify URL.")
 
-exists = os.path.exists(output_file) and os.path.getsize(output_file) > 0
+header = [
+    "Source title",
+    "Source artist",
+    "Spotify candidate title",
+    "Spotify candidate artist",
+    "Spotify URL",
+    "Lookup method",
+]
+
+rows = []
+if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+    try:
+        with open(output_file, "r", newline="", encoding="utf-8") as f:
+            rows = list(csv.reader(f, delimiter="\t"))
+    except Exception:
+        rows = []
+
+    if rows and rows[0] != header:
+        upgraded = [header]
+        for row in rows[1:]:
+            row = row[:]
+            while len(row) < 6:
+                row.append("")
+            if len(row) == 5:
+                row.append("Previous result")
+            upgraded.append(row[:6])
+        rows = upgraded
+else:
+    rows = [header]
+
+rows.append([
+    source_title,
+    source_artist,
+    candidate_title,
+    candidate_artist,
+    spotify_url,
+    "Spotify API",
+])
+
+fd, temp_path = tempfile.mkstemp(
+    prefix=".spotify-links-",
+    dir=os.path.dirname(os.path.abspath(output_file)),
+)
 
 try:
-    with open(output_file, "a", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
-        if not exists:
-            writer.writerow([
-                "Source title",
-                "Source artist",
-                "Spotify title",
-                "Spotify artist",
-                "Spotify URL",
-            ])
-        writer.writerow([
-            title,
-            artist,
-            matched_title,
-            matched_artists,
-            spotify_url,
-        ])
+    with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f, delimiter="\t", lineterminator="\n").writerows(rows)
+    os.replace(temp_path, output_file)
 except Exception as exc:
-    fail("Could not write Spotify link file: " + str(exc))
+    try:
+        os.unlink(temp_path)
+    except OSError:
+        pass
+    fail("Could not save the Spotify result: " + str(exc))
 
-print("Spotify candidate:", matched_title, "-", matched_artists)
+print("Spotify API candidate:", candidate_title, "-", candidate_artist)
 print("Spotify link:", spotify_url)
-print("Saved to:", output_file)
-PYTHON_SCRIPT
+PYTHON_API
+}
+
+# ============================================================
+# Web fallback
+#
+# Search DuckDuckGo HTML for a direct Spotify track URL.
+# If no direct result is available, save a Spotify search URL.
+# Uses Python standard library only.
+# ============================================================
+
+spotify_web_lookup() {
+    local source_url="$1"
+
+    "$PYTHON" - "$YTDLP" "$source_url" "$SPOTIFY_LINKS_FILE" <<'PYTHON_WEB'
+import csv
+import html
+import html.parser
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ytdlp, source_url, output_file = sys.argv[1:4]
+
+def get_metadata():
+    result = subprocess.run(
+        [ytdlp, "--dump-single-json", "--skip-download", source_url],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=120,
+    )
+    data = json.loads(result.stdout)
+
+    title = (data.get("track") or data.get("title") or "").strip()
+    artist = (
+        data.get("artist")
+        or data.get("creator")
+        or data.get("uploader")
+        or ""
+    ).strip()
+
+    if not title:
+        raise ValueError("No title could be extracted from source metadata.")
+
+    return title, artist
+
+class ResultParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.results = []
+        self._anchor = None
+        self._parts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+
+        if tag == "a":
+            classes = attrs.get("class", "").split()
+            if "result__a" in classes and attrs.get("href"):
+                self._anchor = attrs["href"]
+                self._parts = []
+
+    def handle_data(self, data):
+        if self._anchor is not None:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._anchor is not None:
+            title = " ".join("".join(self._parts).split())
+            self.results.append((title, self._anchor))
+            self._anchor = None
+            self._parts = []
+
+def unwrap_result_url(href):
+    href = html.unescape(href)
+    parsed = urllib.parse.urlparse(
+        urllib.parse.urljoin("https://duckduckgo.com/", href)
+    )
+    params = urllib.parse.parse_qs(parsed.query)
+
+    if "uddg" in params and params["uddg"]:
+        return params["uddg"][0]
+
+    return urllib.parse.urlunparse(parsed)
+
+def spotify_track_url(url):
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower()
+
+    if host not in ("open.spotify.com", "www.open.spotify.com"):
+        return ""
+
+    match = re.search(
+        r"/(?:intl-[^/]+/)?track/([A-Za-z0-9]+)",
+        parsed.path,
+    )
+
+    if not match:
+        return ""
+
+    return "https://open.spotify.com/track/" + match.group(1)
+
+def search_web(title, artist):
+    query = f'site:open.spotify.com/track "{title}"'
+    if artist:
+        query += f' "{artist}"'
+
+    search_url = (
+        "https://html.duckduckgo.com/html/?"
+        + urllib.parse.urlencode({"q": query})
+    )
+
+    request = urllib.request.Request(
+        search_url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+        },
+    )
+
+    with urllib.request.urlopen(request, timeout=25) as response:
+        page = response.read().decode("utf-8", errors="replace")
+
+    parser = ResultParser()
+    parser.feed(page)
+
+    for result_title, href in parser.results:
+        target = unwrap_result_url(href)
+        track_url = spotify_track_url(target)
+        if track_url:
+            return result_title, track_url
+
+    return "", ""
+
+def save_result(source_title, source_artist, candidate_title,
+                candidate_artist, url, method):
+    header = [
+        "Source title",
+        "Source artist",
+        "Spotify candidate title",
+        "Spotify candidate artist",
+        "Spotify URL",
+        "Lookup method",
+    ]
+
+    rows = []
+    if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+        try:
+            with open(output_file, "r", newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f, delimiter="\t"))
+        except Exception:
+            rows = []
+
+        if rows and rows[0] != header:
+            upgraded = [header]
+            for row in rows[1:]:
+                row = row[:]
+                while len(row) < 6:
+                    row.append("")
+                if len(row) == 5:
+                    row.append("Previous result")
+                upgraded.append(row[:6])
+            rows = upgraded
+    else:
+        rows = [header]
+
+    rows.append([
+        source_title,
+        source_artist,
+        candidate_title,
+        candidate_artist,
+        url,
+        method,
+    ])
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=".spotify-links-",
+        dir=os.path.dirname(os.path.abspath(output_file)),
+    )
+
+    try:
+        with os.fdopen(fd, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f, delimiter="\t", lineterminator="\n").writerows(rows)
+        os.replace(temp_path, output_file)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+try:
+    source_title, source_artist = get_metadata()
+except Exception as exc:
+    print("Web fallback warning: could not read source metadata:", exc,
+          file=sys.stderr)
+    sys.exit(1)
+
+print("Web search:", source_title, "-", source_artist or "artist unknown")
+
+try:
+    candidate_title, track_url = search_web(source_title, source_artist)
+
+    if track_url:
+        # The title is the search engine's result title, not independently
+        # verified Spotify metadata.
+        save_result(
+            source_title,
+            source_artist,
+            candidate_title,
+            "",
+            track_url,
+            "Web search",
+        )
+        print("Web candidate:", candidate_title)
+        print("Spotify track link:", track_url)
+        print("Please verify the candidate before relying on it.")
+        sys.exit(0)
+
+    # Search did not expose a direct Spotify track URL. Still provide a
+    # useful Spotify search page without falsely claiming an exact match.
+    query = " ".join(part for part in (source_title, source_artist) if part)
+    search_link = (
+        "https://open.spotify.com/search/"
+        + urllib.parse.quote(query, safe="")
+    )
+
+    save_result(
+        source_title,
+        source_artist,
+        "Spotify search page (no direct track match found)",
+        "",
+        search_link,
+        "Spotify search fallback",
+    )
+
+    print("No direct Spotify track URL was found by web search.")
+    print("Saved Spotify search page:", search_link)
+    sys.exit(0)
+
+except urllib.error.HTTPError as exc:
+    print(f"Web search warning: HTTP {exc.code}", file=sys.stderr)
+except Exception as exc:
+    print("Web search warning:", str(exc), file=sys.stderr)
+
+# The search engine may be unavailable or may block automated requests.
+# In that case, save a Spotify search link rather than inventing a match.
+try:
+    query = " ".join(part for part in (source_title, source_artist) if part)
+    search_link = (
+        "https://open.spotify.com/search/"
+        + urllib.parse.quote(query, safe="")
+    )
+
+    save_result(
+        source_title,
+        source_artist,
+        "Spotify search page (web search unavailable)",
+        "",
+        search_link,
+        "Spotify search fallback",
+    )
+
+    print("Web search was unavailable.")
+    print("Saved Spotify search page instead:", search_link)
+    sys.exit(0)
+
+except Exception as exc:
+    print("Could not save Spotify search fallback:", exc, file=sys.stderr)
+    sys.exit(1)
+PYTHON_WEB
+}
+
+# ============================================================
+# Spotify workflow: API first, web fallback if it fails
+# ============================================================
+
+spotify_lookup() {
+    local url="$1"
+
+    echo "Trying Spotify API first..."
+
+    if spotify_api_lookup "$url"; then
+        echo "Spotify API lookup succeeded."
+        return 0
+    fi
+
+    echo
+    echo "Spotify API failed. Falling back to web search..."
+    echo "This can happen if the API returns HTTP 403 or other errors."
+
+    if spotify_web_lookup "$url"; then
+        echo "Spotify web fallback completed."
+        return 0
+    fi
+
+    echo "Warning: both Spotify API and web fallback failed."
+    return 1
 }
 
 # ============================================================
@@ -902,8 +1303,8 @@ echo "Skipped:          $SKIPPED"
 echo "Failed downloads: $FAILED"
 
 if (( SPOTIFY == 1 )); then
-    echo "Spotify matches:  $SPOTIFY_MATCHES"
-    echo "Spotify failures: $SPOTIFY_FAILURES"
+    echo "Spotify results:  $SPOTIFY_MATCHES"
+    echo "Lookup failures:  $SPOTIFY_FAILURES"
     echo "Spotify links:    $SPOTIFY_LINKS_FILE"
 fi
 

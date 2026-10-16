@@ -58,31 +58,6 @@ You can also install dependencies manually:
 - FFmpeg: https://ffmpeg.org/download.html
 - Python: https://www.python.org/downloads/
 
-## Project Structure
-
-A typical project directory looks like this:
-
-```text
-your-project/
-├── download.sh
-├── urls.txt
-├── .env
-├── .example.env
-├── .gitignore
-├── completed-index-video.tsv
-├── completed-index-mp4.tsv
-├── completed-index-audio.tsv
-├── completed-index-mp3.tsv
-└── downloads/
-    ├── archive-video.txt
-    ├── archive-mp4.txt
-    ├── archive-audio.txt
-    ├── archive-mp3.txt
-    └── spotify-links.tsv
-```
-
-Some files are created only after the corresponding download mode or Spotify feature is used. Completion indexes are stored beside the script; downloaded media, yt-dlp archives, and Spotify results are stored in the selected output directory.
-
 ## Setup
 
 ### 1. Put the files together
