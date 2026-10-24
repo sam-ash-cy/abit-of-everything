@@ -532,12 +532,24 @@ mkdir -p "$DOWNLOAD_DIR" || {
 DOWNLOAD_DIR="$(cd -- "$DOWNLOAD_DIR" && pwd)" || exit 1
 SPOTIFY_LINKS_FILE="$DOWNLOAD_DIR/spotify-links.tsv"
 
+# yt-dlp.exe on Git Bash needs a Windows path. Git Bash only converts
+# arguments that look like plain paths, so the --output template
+# (/c/... with %(title)s) would otherwise land in C:\c\...
+YTDLP_DIR="$DOWNLOAD_DIR"
+if [[ "$OS" == "gitbash" ]] && command -v cygpath >/dev/null 2>&1; then
+    YTDLP_DIR="$(cygpath -m "$DOWNLOAD_DIR")"
+fi
+
 CLEAN_FILE="$(mktemp)" || exit 1
 SELECTED_FILE="$(mktemp)" || {
     rm -f "$CLEAN_FILE"
     exit 1
 }
-trap 'rm -f "$CLEAN_FILE" "$SELECTED_FILE"' EXIT
+FILEPATH_FILE="$(mktemp)" || {
+    rm -f "$CLEAN_FILE" "$SELECTED_FILE"
+    exit 1
+}
+trap 'rm -f "$CLEAN_FILE" "$SELECTED_FILE" "$FILEPATH_FILE"' EXIT
 
 # ============================================================
 # Clean URL list
@@ -606,8 +618,14 @@ echo "Output folder: $DOWNLOAD_DIR"
 # Completion tracking
 # ============================================================
 
-COMPLETED_MODE_FILE="${COMPLETED_FILE%.ts}-$MODE.tsv"
-ARCHIVE_FILE="$DOWNLOAD_DIR/archive-$MODE.txt"
+COMPLETED_MODE_FILE="${COMPLETED_FILE%.tsv}-$MODE.tsv"
+
+# Older versions wrote completed-index.tsv-MODE.tsv; carry it over.
+LEGACY_MODE_FILE="$COMPLETED_FILE-$MODE.tsv"
+if [[ -f "$LEGACY_MODE_FILE" && ! -f "$COMPLETED_MODE_FILE" ]]; then
+    mv "$LEGACY_MODE_FILE" "$COMPLETED_MODE_FILE" || exit 1
+fi
+ARCHIVE_FILE="$YTDLP_DIR/archive-$MODE.txt"
 
 touch "$COMPLETED_MODE_FILE" || exit 1
 
@@ -1238,9 +1256,16 @@ while IFS=$'\t' read -r INDEX URL; do
         continue
     fi
 
+    : > "$FILEPATH_FILE"
+    YTDLP_FILEPATH_FILE="$FILEPATH_FILE"
+    if [[ "$OS" == "gitbash" ]] && command -v cygpath >/dev/null 2>&1; then
+        YTDLP_FILEPATH_FILE="$(cygpath -m "$FILEPATH_FILE")"
+    fi
+
     ARGS=(
         --continue
-        --output "$DOWNLOAD_DIR/%(title)s [%(id)s].%(ext)s"
+        --print-to-file after_move:filepath "$YTDLP_FILEPATH_FILE"
+        --output "$YTDLP_DIR/%(title)s [%(id)s].%(ext)s"
     )
 
     if (( REDOWNLOAD == 0 )); then
@@ -1255,7 +1280,10 @@ while IFS=$'\t' read -r INDEX URL; do
             ARGS+=(-f 'bv*+ba/b')
             ;;
         mp4)
-            ARGS+=(-f 'bv*+ba/b' --merge-output-format mp4)
+            # Prefer H.264 + AAC: plays on Windows, TVs, phones and car
+            # stereos. VP9/Opus in MP4 is unsupported on many devices.
+            ARGS+=(-f 'bv*+ba/b' -S 'vcodec:h264,res,acodec:aac'
+                   --merge-output-format mp4)
             ;;
         audio)
             ARGS+=(-x)
@@ -1266,6 +1294,26 @@ while IFS=$'\t' read -r INDEX URL; do
     esac
 
     if "$YTDLP" "${ARGS[@]}" "$URL"; then
+        # Confirm the final file really exists before counting a success.
+        OUT_FILE="$(tail -n 1 "$FILEPATH_FILE" | tr -d '\r')"
+        if [[ -n "$OUT_FILE" && "$OS" == "gitbash" ]] &&
+           command -v cygpath >/dev/null 2>&1; then
+            OUT_FILE="$(cygpath -u "$OUT_FILE")"
+        fi
+
+        if [[ -z "$OUT_FILE" ]]; then
+            echo "yt-dlp skipped it (already in $ARCHIVE_FILE)."
+            SKIPPED=$((SKIPPED + 1))
+            continue
+        fi
+
+        if [[ ! -f "$OUT_FILE" ]]; then
+            echo "Error: yt-dlp reported success, but the file is missing:"
+            echo "  $OUT_FILE"
+            FAILED=$((FAILED + 1))
+            continue
+        fi
+
         if record_completed "$INDEX" "$URL"; then
             echo "Download completed and recorded."
             SUCCESS=$((SUCCESS + 1))

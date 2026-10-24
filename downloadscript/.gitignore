@@ -1,3 +1,4 @@
 .env
 .spotify-credentials
 downloads/
+completed-index*.tsv
